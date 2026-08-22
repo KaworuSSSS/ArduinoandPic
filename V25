@@ -1,0 +1,1366 @@
+/*
+===========================================================
+ PIC18F4550 LVP PROGRAMMER
+ ARDUINO UNO V25
+===========================================================
+
+ PINOUT:
+
+ Arduino UNO       PIC18F4550
+ --------------------------------
+ D10                MCLR
+ D11                PGD
+ D12                PGC
+ D13                PGM
+ GND                GND
+ 5V                 VDD
+
+ V25:
+ - Basado en la rutina funcional V24
+ - Device ID
+ - Erase
+ - Write configurable
+ - Read
+ - Verify
+ - Diagnostico detallado
+ - Sin String para ahorrar RAM
+
+ COMANDOS:
+
+ T
+     Programa 0x1234 en 0x000000
+
+ W 000000 1234
+     Programa 0x1234 en 0x000000
+
+ W 000000 5678
+     Programa 0x5678 en 0x000000
+
+ R 000000
+     Lee 2 bytes
+
+ D
+     Device ID
+
+ E
+     Erase
+
+===========================================================
+*/
+
+#include <Arduino.h>
+
+// ========================================================
+// PINES
+// ========================================================
+
+#define MCLR 10
+#define PGD  11
+#define PGC  12
+#define PGM  13
+
+// ========================================================
+// TIEMPOS
+// ========================================================
+
+#define P9_US       1000
+#define P9A_US      5000
+#define P10_US      200
+#define P11_MS      5
+#define P15_US      400
+#define P18_US      1000
+#define P20_US      1
+
+// ========================================================
+// BUFFER
+// ========================================================
+
+uint8_t buffer[32];
+
+char serialBuffer[40];
+uint8_t serialIndex = 0;
+
+// ========================================================
+// UTILIDADES SERIAL
+// ========================================================
+
+void printHex8(uint8_t b)
+{
+  if (b < 0x10)
+    Serial.print('0');
+
+  Serial.print(b, HEX);
+}
+
+void printHex16(uint16_t v)
+{
+  if (v < 0x1000)
+    Serial.print('0');
+
+  if (v < 0x0100)
+    Serial.print('0');
+
+  if (v < 0x0010)
+    Serial.print('0');
+
+  Serial.print(v, HEX);
+}
+
+void printHex24(uint32_t v)
+{
+  Serial.print(F("0x"));
+
+  uint8_t b2 = (v >> 16) & 0xFF;
+  uint8_t b1 = (v >> 8) & 0xFF;
+  uint8_t b0 = v & 0xFF;
+
+  printHex8(b2);
+  printHex8(b1);
+  printHex8(b0);
+}
+
+// ========================================================
+// BUFFER
+// ========================================================
+
+void nullBuffer()
+{
+  for (uint8_t i = 0; i < 32; i++)
+    buffer[i] = 0xFF;
+}
+
+void printBuffer()
+{
+  Serial.println(F("BUFFER:"));
+
+  for (uint8_t i = 0; i < 32; i++)
+  {
+    printHex8(buffer[i]);
+    Serial.print(' ');
+
+    if (i == 15)
+      Serial.println();
+  }
+
+  Serial.println();
+}
+
+// ========================================================
+// HEX
+// ========================================================
+
+int hexValue(char c)
+{
+  if (c >= '0' && c <= '9')
+    return c - '0';
+
+  if (c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+
+  if (c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+
+  return -1;
+}
+
+uint8_t hexByte(char h, char l)
+{
+  int a = hexValue(h);
+  int b = hexValue(l);
+
+  if (a < 0 || b < 0)
+    return 0;
+
+  return (a << 4) | b;
+}
+
+uint32_t hex24(char *p)
+{
+  uint32_t v = 0;
+
+  for (uint8_t i = 0; i < 6; i++)
+  {
+    int n = hexValue(p[i]);
+
+    if (n < 0)
+      return 0;
+
+    v = (v << 4) | n;
+  }
+
+  return v;
+}
+
+// ========================================================
+// CLOCK
+// ========================================================
+
+void pulseClock()
+{
+  digitalWrite(PGC, HIGH);
+  digitalWrite(PGC, LOW);
+}
+
+// ========================================================
+// SEND 4 BIT COMMAND
+// ========================================================
+
+void send4bitcommand(uint8_t data)
+{
+  pinMode(PGD, OUTPUT);
+
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    if (data & (1 << i))
+      digitalWrite(PGD, HIGH);
+    else
+      digitalWrite(PGD, LOW);
+
+    pulseClock();
+  }
+}
+
+// ========================================================
+// SEND BYTE MSB
+// ========================================================
+
+void sendbyte(uint8_t data)
+{
+  pinMode(PGD, OUTPUT);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    if (data & (0x80 >> i))
+      digitalWrite(PGD, HIGH);
+    else
+      digitalWrite(PGD, LOW);
+
+    pulseClock();
+  }
+}
+
+// ========================================================
+// SEND 16 BIT
+// ========================================================
+
+void send16bit(uint16_t data)
+{
+  pinMode(PGD, OUTPUT);
+
+  for (uint8_t i = 0; i < 16; i++)
+  {
+    if (data & (1 << i))
+      digitalWrite(PGD, HIGH);
+    else
+      digitalWrite(PGD, LOW);
+
+    pulseClock();
+  }
+}
+
+// ========================================================
+// READ BYTE
+// ========================================================
+
+uint8_t readbyte()
+{
+  uint8_t val = 0;
+
+  pinMode(PGD, INPUT);
+
+  digitalWrite(PGD, LOW);
+
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    digitalWrite(PGC, HIGH);
+
+    if (digitalRead(PGD))
+      val |= (1 << i);
+
+    digitalWrite(PGC, LOW);
+  }
+
+  return val;
+}
+
+// ========================================================
+// ENTRADA LVP
+// ========================================================
+
+void enterLVP()
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ENTRADA LVP"));
+  Serial.println(F("================================"));
+
+  pinMode(PGC, OUTPUT);
+  pinMode(PGD, OUTPUT);
+  pinMode(PGM, OUTPUT);
+  pinMode(MCLR, OUTPUT);
+
+  digitalWrite(PGC, LOW);
+  digitalWrite(PGD, LOW);
+  digitalWrite(PGM, HIGH);
+  digitalWrite(MCLR, LOW);
+
+  Serial.println(F("PGC = LOW"));
+  Serial.println(F("PGD = LOW"));
+  Serial.println(F("PGM = HIGH"));
+  Serial.println(F("MCLR = LOW"));
+
+  Serial.println(F("ENVIANDO SECUENCIA MCHP"));
+
+  uint32_t seq = 0x4D434850UL;
+
+  sendbyte((seq >> 24) & 0xFF);
+  sendbyte((seq >> 16) & 0xFF);
+  sendbyte((seq >> 8) & 0xFF);
+  sendbyte(seq & 0xFF);
+
+  delayMicroseconds(P20_US);
+
+  digitalWrite(MCLR, HIGH);
+
+  delayMicroseconds(P15_US);
+
+  Serial.println(F("MCLR = HIGH"));
+  Serial.println(F("LVP ACTIVADO"));
+}
+
+// ========================================================
+// SALIR LVP
+// ========================================================
+
+void exitLVP()
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("SALIENDO DE LVP"));
+  Serial.println(F("================================"));
+
+  digitalWrite(PGM, LOW);
+  digitalWrite(MCLR, LOW);
+  digitalWrite(PGC, LOW);
+  digitalWrite(PGD, LOW);
+
+  Serial.println(F("PGM = LOW"));
+  Serial.println(F("MCLR = LOW"));
+  Serial.println(F("LVP TERMINADO"));
+}
+
+// ========================================================
+// READ FLASH
+// ========================================================
+
+uint8_t readFlash(uint8_t upper,
+                  uint8_t msb,
+                  uint8_t lsb)
+{
+  uint8_t value = 0;
+
+  pinMode(PGD, OUTPUT);
+
+  // MOVLW upper
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | upper);
+
+  // MOVWF TBLPTRU
+  send4bitcommand(0b0000);
+  send16bit(0x6EF8);
+
+  // MOVLW MSB
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | msb);
+
+  // MOVWF TBLPTRH
+  send4bitcommand(0b0000);
+  send16bit(0x6EF7);
+
+  // MOVLW LSB
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | lsb);
+
+  // MOVWF TBLPTRL
+  send4bitcommand(0b0000);
+  send16bit(0x6EF6);
+
+  // TBLRD
+  send4bitcommand(0b1000);
+
+  pinMode(PGD, INPUT);
+  digitalWrite(PGD, LOW);
+
+  // dummy
+  for (uint8_t i = 0; i < 8; i++)
+    pulseClock();
+
+  // read
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    digitalWrite(PGC, HIGH);
+
+    if (digitalRead(PGD))
+      value |= (1 << i);
+
+    digitalWrite(PGC, LOW);
+  }
+
+  return value;
+}
+
+// ========================================================
+// DEVICE ID
+// ========================================================
+
+uint16_t readDeviceID()
+{
+  uint8_t id1;
+  uint8_t id2;
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("DEVICE ID"));
+  Serial.println(F("================================"));
+
+  Serial.println(F("TBLPTR = 0x3FFFFE"));
+
+  id1 = readFlash(0x3F, 0xFF, 0xFE);
+
+  Serial.print(F("DEVID1 = 0x"));
+  printHex8(id1);
+  Serial.println();
+
+  Serial.println(F("TBLPTR = 0x3FFFFF"));
+
+  id2 = readFlash(0x3F, 0xFF, 0xFF);
+
+  Serial.print(F("DEVID2 = 0x"));
+  printHex8(id2);
+  Serial.println();
+
+  uint16_t id = ((uint16_t)id2 << 8) | id1;
+
+  Serial.print(F("DEVICE ID RAW = 0x"));
+  printHex16(id);
+  Serial.println();
+
+  return id;
+}
+
+// ========================================================
+// ERASE ALL
+// ========================================================
+
+void eraseAll()
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ERASE ALL"));
+  Serial.println(F("================================"));
+
+  // EEPGD = 1
+  send4bitcommand(0b0000);
+  send16bit(0x0E3C);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF8);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0E00);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF7);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0E05);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF6);
+
+  // ERASE
+  send4bitcommand(0b1100);
+  send16bit(0x3F3F);
+
+  // CFG
+  send4bitcommand(0b0000);
+  send16bit(0x0E3C);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF8);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0E00);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF7);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0E04);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF6);
+
+  send4bitcommand(0b1100);
+  send16bit(0x8F8F);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0000);
+
+  delay(2);
+
+  send4bitcommand(0b0000);
+  send16bit(0x0000);
+
+  delay(2);
+
+  digitalWrite(PGD, LOW);
+
+  delay(P11_MS);
+
+  digitalWrite(PGD, HIGH);
+
+  Serial.println(F("ERASE TERMINADO"));
+}
+
+// ========================================================
+// LOAD WRITE BUFFER
+// ========================================================
+
+bool loadWriteBuffer(uint32_t address)
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("LOAD WRITE BUFFER"));
+  Serial.println(F("================================"));
+
+  Serial.print(F("TBLPTR = "));
+  printHex24(address);
+  Serial.println();
+
+  uint8_t upper = (address >> 16) & 0xFF;
+  uint8_t msb   = (address >> 8) & 0xFF;
+  uint8_t lsb   = address & 0xFF;
+
+  // EEPGD = 1
+  send4bitcommand(0b0000);
+  send16bit(0x8EA6);
+
+  // CFGS = 0
+  send4bitcommand(0b0000);
+  send16bit(0x9CA6);
+
+  // TBLPTRU
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | upper);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF8);
+
+  // TBLPTRH
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | msb);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF7);
+
+  // TBLPTRL
+  send4bitcommand(0b0000);
+  send16bit(0x0E00 | lsb);
+
+  send4bitcommand(0b0000);
+  send16bit(0x6EF6);
+
+  // 15 pares normales
+  for (uint8_t i = 0; i < 15; i++)
+  {
+    uint16_t word =
+      ((uint16_t)buffer[(i * 2) + 1] << 8) |
+      buffer[(i * 2)];
+
+    Serial.print(F("PAIR "));
+    Serial.print(i);
+    Serial.print(F(" ADDR 0x"));
+
+    uint8_t a = i * 2;
+    printHex8(a);
+
+    Serial.print(F(" DATA 0x"));
+    printHex16(word);
+    Serial.println();
+
+    send4bitcommand(0b1101);
+    send16bit(word);
+  }
+
+  // Último par: comando 1111
+  uint16_t lastWord =
+    ((uint16_t)buffer[31] << 8) |
+    buffer[30];
+
+  Serial.println(F("COMANDO FINAL = 1111"));
+
+  Serial.print(F("ULTIMO PAR = 0x"));
+  printHex16(lastWord);
+  Serial.println();
+
+  send4bitcommand(0b1111);
+  send16bit(lastWord);
+
+  Serial.println(F("ULTIMO PAR ENVIADO"));
+
+  Serial.println(F("32 BYTES TRANSMITIDOS"));
+
+  return true;
+}
+
+// ========================================================
+// PROGRAM FLASH
+// ========================================================
+
+bool programFlash()
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("PROGRAM FLASH"));
+  Serial.println(F("================================"));
+
+  Serial.println(F("COMANDO = 1111"));
+  Serial.println(F("INICIO PROGRAMMING"));
+
+  // NOP x3
+  digitalWrite(PGD, LOW);
+
+  pulseClock();
+  pulseClock();
+  pulseClock();
+
+  Serial.println(F("NOP x3"));
+
+  // P9
+  digitalWrite(PGC, HIGH);
+
+  Serial.println(F("P9 START"));
+
+  delayMicroseconds(P9_US);
+
+  digitalWrite(PGC, LOW);
+
+  Serial.println(F("P9 END"));
+
+  delayMicroseconds(P10_US);
+
+  Serial.println(F("P10 END"));
+
+  // terminado
+  send16bit(0x0000);
+
+  Serial.println(F("PROGRAMMING SEQUENCE TERMINADA"));
+
+  return true;
+}
+
+// ========================================================
+// READ 32 BYTES
+// ========================================================
+
+void read32(uint32_t address,
+            uint8_t *dest)
+{
+  uint32_t a = address;
+
+  for (uint8_t i = 0; i < 32; i++)
+  {
+    dest[i] =
+      readFlash(
+        (a >> 16) & 0xFF,
+        (a >> 8) & 0xFF,
+        a & 0xFF
+      );
+
+    a++;
+  }
+}
+
+// ========================================================
+// VERIFICAR
+// ========================================================
+
+bool verifyWord(uint32_t address,
+                uint16_t expected)
+{
+  uint8_t lo =
+    readFlash(
+      (address >> 16) & 0xFF,
+      (address >> 8) & 0xFF,
+      address & 0xFF
+    );
+
+  uint8_t hi =
+    readFlash(
+      (address >> 16) & 0xFF,
+      (address >> 8) & 0xFF,
+      (address + 1) & 0xFF
+    );
+
+  uint16_t readValue =
+    ((uint16_t)hi << 8) | lo;
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("VERIFICACION"));
+  Serial.println(F("================================"));
+
+  Serial.print(F("ESPERADO = 0x"));
+  printHex16(expected);
+  Serial.println();
+
+  Serial.print(F("LEIDO    = 0x"));
+  printHex16(readValue);
+  Serial.println();
+
+  if (readValue == expected)
+  {
+    Serial.println();
+    Serial.println(F("********************************"));
+    Serial.println(F(" PROGRAMACION CORRECTA"));
+    Serial.println(F("********************************"));
+
+    return true;
+  }
+
+  Serial.print(F("ERROR BYTE 0 ESPERADO=0x"));
+  printHex8(expected & 0xFF);
+
+  Serial.print(F(" LEIDO=0x"));
+  printHex8(lo);
+
+  Serial.println();
+
+  Serial.print(F("ERROR BYTE 1 ESPERADO=0x"));
+  printHex8((expected >> 8) & 0xFF);
+
+  Serial.print(F(" LEIDO=0x"));
+  printHex8(hi);
+
+  Serial.println();
+
+  Serial.println();
+  Serial.println(F("********************************"));
+  Serial.println(F(" PROGRAMACION FALLIDA"));
+  Serial.println(F("********************************"));
+
+  return false;
+}
+
+// ========================================================
+// LEER Y MOSTRAR 32 BYTES
+// ========================================================
+
+void dump32(uint32_t address)
+{
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("FLASH READ"));
+  Serial.println(F("================================"));
+
+  for (uint8_t i = 0; i < 32; i++)
+  {
+    uint32_t a = address + i;
+
+    uint8_t v =
+      readFlash(
+        (a >> 16) & 0xFF,
+        (a >> 8) & 0xFF,
+        a & 0xFF
+      );
+
+    if (i == 0x00)
+      Serial.print(F("0x00: "));
+
+    if (i == 0x10)
+      Serial.print(F("0x10: "));
+
+    printHex8(v);
+    Serial.print(' ');
+
+    if (i == 15 || i == 31)
+      Serial.println();
+  }
+}
+
+// ========================================================
+// PRUEBA COMPLETA
+// ========================================================
+
+void test1234()
+{
+  uint32_t address = 0x000000;
+
+  uint16_t word = 0x1234;
+
+  Serial.println();
+  Serial.println(F("########################################"));
+  Serial.println(F(" PIC18F4550 V25"));
+  Serial.println(F(" DIAGNOSTICO FLASH"));
+  Serial.println(F("########################################"));
+
+  enterLVP();
+
+  // ------------------------------------------------------
+  // DEVICE ID
+  // ------------------------------------------------------
+
+  uint16_t id = readDeviceID();
+
+  if (id == 0x1207)
+  {
+    Serial.println(F("DEVICE ID: OK"));
+  }
+  else
+  {
+    Serial.println(F("DEVICE ID: FALLA"));
+  }
+
+  // ------------------------------------------------------
+  // ERASE
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 2: ERASE"));
+  Serial.println(F("================================"));
+
+  eraseAll();
+
+  uint8_t erased =
+    readFlash(0x00, 0x00, 0x00);
+
+  Serial.print(F("FLASH[0x000000] AFTER ERASE = 0x"));
+  printHex8(erased);
+  Serial.println();
+
+  if (erased == 0xFF)
+    Serial.println(F("ERASE VERIFY: OK"));
+  else
+    Serial.println(F("ERASE VERIFY: FALLA"));
+
+  // ------------------------------------------------------
+  // BUFFER
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 3: WRITE BUFFER"));
+  Serial.println(F("================================"));
+
+  nullBuffer();
+
+  buffer[0] = word & 0xFF;
+  buffer[1] = (word >> 8) & 0xFF;
+
+  printBuffer();
+
+  Serial.println(F("ESPERADO:"));
+  Serial.println(F("ADDR 0x000000 = 0x1234"));
+
+  // ------------------------------------------------------
+  // LOAD
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 4: LOAD WRITE BUFFER"));
+  Serial.println(F("================================"));
+
+  loadWriteBuffer(address);
+
+  // ------------------------------------------------------
+  // PROGRAM
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 5: PROGRAM FLASH"));
+  Serial.println(F("================================"));
+
+  programFlash();
+
+  // ------------------------------------------------------
+  // READ
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 6: FLASH READ"));
+  Serial.println(F("================================"));
+
+  dump32(address);
+
+  // ------------------------------------------------------
+  // VERIFY
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("ETAPA 7: VERIFICACION"));
+  Serial.println(F("================================"));
+
+  verifyWord(address, word);
+
+  exitLVP();
+
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F("PROCESO V25 TERMINADO"));
+  Serial.println(F("================================"));
+
+  Serial.println(F("Comandos:"));
+  Serial.println(F("T"));
+  Serial.println(F("W 000000 1234"));
+  Serial.println(F("W 000000 5678"));
+  Serial.println(F("R 000000"));
+  Serial.println(F("D"));
+  Serial.println(F("E"));
+}
+
+// ========================================================
+// WRITE PERSONALIZADO
+// ========================================================
+
+void writeCustom(uint32_t address,
+                 uint16_t word)
+{
+  Serial.println();
+  Serial.println(F("########################################"));
+  Serial.println(F(" V25 WRITE PERSONALIZADO"));
+  Serial.println(F("########################################"));
+
+  Serial.print(F("DIRECCION = "));
+  printHex24(address);
+  Serial.println();
+
+  Serial.print(F("DATO      = 0x"));
+  printHex16(word);
+  Serial.println();
+
+  if ((address & 0x0F) != 0)
+  {
+    Serial.println();
+    Serial.println(F("ERROR: direccion no alineada"));
+    Serial.println(F("La direccion debe terminar en 0"));
+    return;
+  }
+
+  enterLVP();
+
+  // ------------------------------------------------------
+  // DEVICE ID
+  // ------------------------------------------------------
+
+  uint16_t id = readDeviceID();
+
+  if (id != 0x1207)
+  {
+    Serial.println(F("ERROR: DEVICE ID INCORRECTO"));
+    exitLVP();
+    return;
+  }
+
+  Serial.println(F("DEVICE ID: OK"));
+
+  // ------------------------------------------------------
+  // ERASE
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("ETAPA 2: ERASE"));
+
+  eraseAll();
+
+  uint8_t erased =
+    readFlash(0x00, 0x00, 0x00);
+
+  if (erased != 0xFF)
+  {
+    Serial.println(F("ERROR: ERASE VERIFY FALLA"));
+    exitLVP();
+    return;
+  }
+
+  Serial.println(F("ERASE VERIFY: OK"));
+
+  // ------------------------------------------------------
+  // BUFFER
+  // ------------------------------------------------------
+
+  nullBuffer();
+
+  buffer[0] = word & 0xFF;
+  buffer[1] = (word >> 8) & 0xFF;
+
+  Serial.println();
+  Serial.println(F("ETAPA 3: BUFFER"));
+
+  printBuffer();
+
+  // ------------------------------------------------------
+  // LOAD
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("ETAPA 4: LOAD WRITE BUFFER"));
+
+  loadWriteBuffer(address);
+
+  // ------------------------------------------------------
+  // PROGRAM
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("ETAPA 5: PROGRAM FLASH"));
+
+  programFlash();
+
+  // ------------------------------------------------------
+  // READ
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("ETAPA 6: FLASH READ"));
+
+  dump32(address);
+
+  // ------------------------------------------------------
+  // VERIFY
+  // ------------------------------------------------------
+
+  Serial.println();
+  Serial.println(F("ETAPA 7: VERIFY"));
+
+  verifyWord(address, word);
+
+  exitLVP();
+
+  Serial.println();
+  Serial.println(F("V25 WRITE TERMINADO"));
+}
+
+// ========================================================
+// READ COMMAND
+// ========================================================
+
+void readCustom(uint32_t address)
+{
+  Serial.println();
+  Serial.println(F("########################################"));
+  Serial.println(F(" V25 READ"));
+  Serial.println(F("########################################"));
+
+  Serial.print(F("DIRECCION = "));
+  printHex24(address);
+  Serial.println();
+
+  enterLVP();
+
+  uint16_t id = readDeviceID();
+
+  if (id != 0x1207)
+  {
+    Serial.println(F("DEVICE ID INCORRECTO"));
+    exitLVP();
+    return;
+  }
+
+  uint8_t lo =
+    readFlash(
+      (address >> 16) & 0xFF,
+      (address >> 8) & 0xFF,
+      address & 0xFF
+    );
+
+  uint32_t a1 = address + 1;
+
+  uint8_t hi =
+    readFlash(
+      (a1 >> 16) & 0xFF,
+      (a1 >> 8) & 0xFF,
+      a1 & 0xFF
+    );
+
+  uint16_t value =
+    ((uint16_t)hi << 8) | lo;
+
+  Serial.println();
+  Serial.println(F("RESULTADO"));
+
+  Serial.print(F("LOW  = 0x"));
+  printHex8(lo);
+  Serial.println();
+
+  Serial.print(F("HIGH = 0x"));
+  printHex8(hi);
+  Serial.println();
+
+  Serial.print(F("WORD = 0x"));
+  printHex16(value);
+  Serial.println();
+
+  exitLVP();
+}
+
+// ========================================================
+// DEVICE ID COMMAND
+// ========================================================
+
+void commandDeviceID()
+{
+  enterLVP();
+
+  uint16_t id = readDeviceID();
+
+  if (id == 0x1207)
+    Serial.println(F("DEVICE ID: OK"));
+  else
+    Serial.println(F("DEVICE ID: FALLA"));
+
+  exitLVP();
+}
+
+// ========================================================
+// ERASE COMMAND
+// ========================================================
+
+void commandErase()
+{
+  enterLVP();
+
+  uint16_t id = readDeviceID();
+
+  if (id != 0x1207)
+  {
+    Serial.println(F("DEVICE ID INCORRECTO"));
+    exitLVP();
+    return;
+  }
+
+  eraseAll();
+
+  uint8_t v =
+    readFlash(0x00, 0x00, 0x00);
+
+  Serial.print(F("VERIFY = 0x"));
+  printHex8(v);
+  Serial.println();
+
+  if (v == 0xFF)
+    Serial.println(F("ERASE VERIFY: OK"));
+  else
+    Serial.println(F("ERASE VERIFY: FALLA"));
+
+  exitLVP();
+}
+
+// ========================================================
+// PROCESAR COMANDO
+// ========================================================
+
+void processCommand(char *cmd)
+{
+  while (*cmd == ' ')
+    cmd++;
+
+  // ------------------------------------------------------
+  // T
+  // ------------------------------------------------------
+
+  if (cmd[0] == 'T' ||
+      cmd[0] == 't')
+  {
+    test1234();
+    return;
+  }
+
+  // ------------------------------------------------------
+  // D
+  // ------------------------------------------------------
+
+  if (cmd[0] == 'D' ||
+      cmd[0] == 'd')
+  {
+    commandDeviceID();
+    return;
+  }
+
+  // ------------------------------------------------------
+  // E
+  // ------------------------------------------------------
+
+  if (cmd[0] == 'E' ||
+      cmd[0] == 'e')
+  {
+    commandErase();
+    return;
+  }
+
+  // ------------------------------------------------------
+  // W
+  // ------------------------------------------------------
+
+  if (cmd[0] == 'W' ||
+      cmd[0] == 'w')
+  {
+    char *p = cmd + 1;
+
+    while (*p == ' ')
+      p++;
+
+    // Necesitamos:
+    // W 000000 1234
+
+    if (strlen(p) < 11)
+    {
+      Serial.println(F("ERROR FORMATO"));
+      Serial.println(F("USO: W 000000 1234"));
+      return;
+    }
+
+    uint32_t address = hex24(p);
+
+    while (*p && *p != ' ')
+      p++;
+
+    while (*p == ' ')
+      p++;
+
+    if (strlen(p) < 4)
+    {
+      Serial.println(F("ERROR DATO"));
+      return;
+    }
+
+    uint16_t word =
+      ((uint16_t)hexByte(p[0], p[1]) << 8) |
+      hexByte(p[2], p[3]);
+
+    writeCustom(address, word);
+
+    return;
+  }
+
+  // ------------------------------------------------------
+  // R
+  // ------------------------------------------------------
+
+  if (cmd[0] == 'R' ||
+      cmd[0] == 'r')
+  {
+    char *p = cmd + 1;
+
+    while (*p == ' ')
+      p++;
+
+    if (strlen(p) < 6)
+    {
+      Serial.println(F("ERROR FORMATO"));
+      Serial.println(F("USO: R 000000"));
+      return;
+    }
+
+    uint32_t address = hex24(p);
+
+    readCustom(address);
+
+    return;
+  }
+
+  Serial.println(F("COMANDO NO RECONOCIDO"));
+
+  Serial.println(F("COMANDOS DISPONIBLES:"));
+  Serial.println(F("T"));
+  Serial.println(F("W 000000 1234"));
+  Serial.println(F("R 000000"));
+  Serial.println(F("D"));
+  Serial.println(F("E"));
+}
+
+// ========================================================
+// SETUP
+// ========================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  pinMode(PGC, OUTPUT);
+  pinMode(PGD, OUTPUT);
+  pinMode(PGM, OUTPUT);
+  pinMode(MCLR, OUTPUT);
+
+  digitalWrite(PGC, LOW);
+  digitalWrite(PGD, LOW);
+  digitalWrite(PGM, LOW);
+  digitalWrite(MCLR, LOW);
+
+  nullBuffer();
+
+  Serial.println();
+  Serial.println(F("=========================================="));
+  Serial.println(F(" ARDUINO UNO -> PIC18F4550"));
+  Serial.println(F(" PROGRAMADOR LVP V25"));
+  Serial.println(F("=========================================="));
+
+  Serial.println(F("D10 -> MCLR"));
+  Serial.println(F("D11 -> PGD"));
+  Serial.println(F("D12 -> PGC"));
+  Serial.println(F("D13 -> PGM"));
+
+  Serial.println();
+  Serial.println(F("COMANDOS:"));
+  Serial.println(F("T = prueba 0x1234"));
+  Serial.println(F("W 000000 1234 = escribir"));
+  Serial.println(F("R 000000 = leer"));
+  Serial.println(F("D = Device ID"));
+  Serial.println(F("E = Erase"));
+
+  Serial.println();
+  Serial.println(F("Arduino iniciado."));
+  Serial.println(F("Velocidad Serial: 115200"));
+  Serial.println();
+  Serial.println(F("Escribe T para prueba."));
+}
+
+// ========================================================
+// LOOP
+// ========================================================
+
+void loop()
+{
+  while (Serial.available())
+  {
+    char c = Serial.read();
+
+    if (c == '\r' || c == '\n')
+    {
+      if (serialIndex > 0)
+      {
+        serialBuffer[serialIndex] = '\0';
+
+        processCommand(serialBuffer);
+
+        serialIndex = 0;
+        serialBuffer[0] = '\0';
+
+        Serial.println();
+        Serial.println(F("Escribe comando:"));
+      }
+    }
+    else
+    {
+      if (serialIndex < sizeof(serialBuffer) - 1)
+      {
+        serialBuffer[serialIndex++] = c;
+      }
+    }
+  }
+}
